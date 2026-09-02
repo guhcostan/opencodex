@@ -2069,8 +2069,10 @@ function dropMuseSparkOverlongToolNames(body: unknown, modelId: unknown): unknow
     if (input.some((item, index) => item !== (next.input as unknown[])[index])) next = { ...next, input };
   }
   if (dropped.size > 0) {
-    // eslint-disable-next-line no-console
-    console.warn(`[opencodex] muse-spark: dropped ${dropped.size} tool(s) with names >64 chars rejected by Zen Go`);
+    debugProviderDiagnostic("openai-responses", "muse-spark-tools-dropped", {
+      reason: "tool-name-gt-64-chars",
+      count: dropped.size,
+    });
     if (isPlainObject(next.tool_choice) && typeof next.tool_choice.name === "string" && dropped.has(next.tool_choice.name)) {
       next = { ...next, tool_choice: "auto" };
     }
@@ -2135,8 +2137,11 @@ function dropMuseSparkRecursiveSchemaTools(body: unknown, modelId: unknown): unk
     if (input.some((item, index) => item !== (next.input as unknown[])[index])) next = { ...next, input };
   }
   if (dropped.size > 0) {
-    // eslint-disable-next-line no-console
-    console.warn(`[opencodex] muse-spark: dropped ${dropped.size} tool(s) with recursive schemas rejected by Zen Go: ${[...dropped].join(", ")}`);
+    debugProviderDiagnostic("openai-responses", "muse-spark-tools-dropped", {
+      reason: "recursive-schema",
+      count: dropped.size,
+      tools: [...dropped],
+    });
     if (isPlainObject(next.tool_choice) && typeof next.tool_choice.name === "string" && dropped.has(next.tool_choice.name)) {
       next = { ...next, tool_choice: "auto" };
     }
