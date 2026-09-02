@@ -24,6 +24,7 @@ import { injectXaiResponsesXSearch, normalizeXaiResponsesWebSearch } from "./xai
 import { EMPTY_TOOL_OUTPUT_ANNOTATION, isWhitespaceOnlyTextPartArray } from "./empty-tool-output-annotation";
 import {
   isXaiSchemaTarget,
+  lookupLocalJsonPointer,
   normalizeXaiToolParameters,
   XaiToolSchemaCompatibilityError,
 } from "./xai-tool-schema";
@@ -1974,9 +1975,22 @@ export function stripOpenAiOnlyWebSearchFields(body: unknown): unknown {
  * shape, so this is Muse-only. Drop only the field the gateway refuses while
  * keeping the tool type and every other accepted option intact.
  */
+/**
+ * Muse Spark models served over Responses on Zen Go share the same gateway
+ * restrictions (probed 2026-08-26 for 1.2, 2026-09-02 for 1.3): plain
+ * `web_search` must not carry `search_content_types`, tool names are capped at
+ * 64 chars, and parameter schemas must not be recursive. The predicate matches
+ * the bare model id with or without a `provider/` namespace prefix.
+ */
+function isMuseSparkGatewayModel(modelId: unknown): boolean {
+  const normalized = typeof modelId === "string" ? modelId.trim().toLowerCase() : "";
+  const base = normalized.includes("/") ? normalized.split("/").pop() ?? normalized : normalized;
+  return base === "muse-spark-1.2-contributor" || base === "muse-spark-1.3-contributor";
+}
+
 function stripMuseSparkUnsupportedWebSearchFields(body: unknown, modelId: unknown): unknown {
   if (!isPlainObject(body)) return body;
-  if (typeof modelId !== "string" || modelId.trim().toLowerCase() !== "muse-spark-1.2-contributor") return body;
+  if (!isMuseSparkGatewayModel(modelId)) return body;
 
   const rewriteTools = (tools: unknown[]): { tools: unknown[]; changed: boolean } => {
     let changed = false;
@@ -2014,6 +2028,120 @@ function stripMuseSparkUnsupportedWebSearchFields(body: unknown, modelId: unknow
     }
   }
   return changed ? next : body;
+}
+
+/**
+ * Zen Go rejects function/custom tool names longer than 64 chars
+ * (`name must be at most 64 characters`), while Codex attaches MCP tools such
+ * as `mcp__codex_apps__codex_document_control___get_document_tool_schemas`
+ * (67 chars). Dropping only the over-long declarations (top-level and
+ * additional_tools) lets the turn proceed with the remaining catalog; the
+ * model simply cannot be offered those few tools. A tool_choice naming a
+ * dropped tool falls back to auto to avoid a second 400.
+ */
+function dropMuseSparkOverlongToolNames(body: unknown, modelId: unknown): unknown {
+  if (!isPlainObject(body)) return body;
+  if (!isMuseSparkGatewayModel(modelId)) return body;
+  const dropped = new Set<string>();
+  const filterTools = (tools: unknown[]): { tools: unknown[]; changed: boolean } => {
+    let changed = false;
+    const kept = tools.filter(tool => {
+      if (!isPlainObject(tool)) return true;
+      if (tool.type !== "function" && tool.type !== "custom") return true;
+      if (typeof tool.name !== "string" || tool.name.length <= 64) return true;
+      dropped.add(tool.name);
+      changed = true;
+      return false;
+    });
+    return { tools: changed ? kept : tools, changed };
+  };
+  let next: Record<string, unknown> = body;
+  if (Array.isArray(body.tools)) {
+    const rewritten = filterTools(body.tools);
+    if (rewritten.changed) next = { ...next, tools: rewritten.tools };
+  }
+  if (Array.isArray(next.input)) {
+    const input = next.input.map(item => {
+      if (!isPlainObject(item) || item.type !== "additional_tools" || !Array.isArray(item.tools)) return item;
+      const rewritten = filterTools(item.tools);
+      return rewritten.changed ? { ...item, tools: rewritten.tools } : item;
+    });
+    if (input.some((item, index) => item !== (next.input as unknown[])[index])) next = { ...next, input };
+  }
+  if (dropped.size > 0) {
+    // eslint-disable-next-line no-console
+    console.warn(`[opencodex] muse-spark: dropped ${dropped.size} tool(s) with names >64 chars rejected by Zen Go`);
+    if (isPlainObject(next.tool_choice) && typeof next.tool_choice.name === "string" && dropped.has(next.tool_choice.name)) {
+      next = { ...next, tool_choice: "auto" };
+    }
+  }
+  return next === body ? body : next;
+}
+
+/**
+ * Zen Go rejects recursive JSON schemas (`Recursive JSON schemas are not
+ * currently supported`), which some MCP tools carry via cyclic local `$ref`s.
+ * Structural identity cycles cannot reach this point (JSON serialization would
+ * have thrown first), so only the `$ref` graph is checked, reusing the tested
+ * lookupLocalJsonPointer helper. Tools with cyclic schemas are dropped for
+ * Muse Spark models only; siblings sharing one `$defs` entry (diamonds) are
+ * kept. A tool_choice naming a dropped tool falls back to auto.
+ */
+function schemaRefGraphHasCycle(parameters: unknown): boolean {
+  if (!isPlainObject(parameters)) return false;
+  const root: Record<string, unknown> = parameters;
+  const visit = (node: unknown, stack: string[]): boolean => {
+    if (Array.isArray(node)) return node.some(child => visit(child, stack));
+    if (!isPlainObject(node)) return false;
+    if (typeof node.$ref === "string") {
+      if (stack.includes(node.$ref)) return true;
+      // Remote or unresolvable refs cannot be judged locally; leave them alone.
+      if (!node.$ref.startsWith("#/") && node.$ref !== "#" && node.$ref !== "#/") return false;
+      const target = lookupLocalJsonPointer(root, node.$ref);
+      if (target === undefined) return false;
+      return visit(target, [...stack, node.$ref]);
+    }
+    return Object.values(node).some(child => visit(child, stack));
+  };
+  return visit(root, []);
+}
+
+function dropMuseSparkRecursiveSchemaTools(body: unknown, modelId: unknown): unknown {
+  if (!isPlainObject(body)) return body;
+  if (!isMuseSparkGatewayModel(modelId)) return body;
+  const dropped = new Set<string>();
+  const filterTools = (tools: unknown[]): { tools: unknown[]; changed: boolean } => {
+    let changed = false;
+    const kept = tools.filter(tool => {
+      if (!isPlainObject(tool) || tool.type !== "function") return true;
+      if (!isPlainObject(tool.parameters) || !schemaRefGraphHasCycle(tool.parameters)) return true;
+      if (typeof tool.name === "string") dropped.add(tool.name);
+      changed = true;
+      return false;
+    });
+    return { tools: changed ? kept : tools, changed };
+  };
+  let next: Record<string, unknown> = body;
+  if (Array.isArray(body.tools)) {
+    const rewritten = filterTools(body.tools);
+    if (rewritten.changed) next = { ...next, tools: rewritten.tools };
+  }
+  if (Array.isArray(next.input)) {
+    const input = next.input.map(item => {
+      if (!isPlainObject(item) || item.type !== "additional_tools" || !Array.isArray(item.tools)) return item;
+      const rewritten = filterTools(item.tools);
+      return rewritten.changed ? { ...item, tools: rewritten.tools } : item;
+    });
+    if (input.some((item, index) => item !== (next.input as unknown[])[index])) next = { ...next, input };
+  }
+  if (dropped.size > 0) {
+    // eslint-disable-next-line no-console
+    console.warn(`[opencodex] muse-spark: dropped ${dropped.size} tool(s) with recursive schemas rejected by Zen Go: ${[...dropped].join(", ")}`);
+    if (isPlainObject(next.tool_choice) && typeof next.tool_choice.name === "string" && dropped.has(next.tool_choice.name)) {
+      next = { ...next, tool_choice: "auto" };
+    }
+  }
+  return next === body ? body : next;
 }
 
 /** Replace every `input_image` part under a routed-compaction body with a short marker. */
@@ -2238,6 +2366,8 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
           outBody = stripOpenAiOnlyWebSearchFields(outBody);
         }
         outBody = stripMuseSparkUnsupportedWebSearchFields(outBody, parsed.modelId);
+        outBody = dropMuseSparkOverlongToolNames(outBody, parsed.modelId);
+        outBody = dropMuseSparkRecursiveSchemaTools(outBody, parsed.modelId);
         // Last, so promoted namespace children are also cleared of Codex-private fields.
         outBody = stripCanonicalOnlyToolFields(outBody, provider.supportsOpenAiWebSearchToolFields === false);
       }

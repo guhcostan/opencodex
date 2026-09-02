@@ -83,5 +83,92 @@ describe("#2617 Muse Spark web_search compatibility", () => {
     expect(defaults["muse-spark-1.2-contributor"]).toBe("openai-responses");
     // An exact-model allowlist, not a family rule: a sibling must not be dragged along.
     expect(defaults["muse-spark-1.2"]).toBeUndefined();
+    // 1.3 serves the same Responses-only shape on Zen Go (probed: /chat/completions -> 500).
+    expect(defaults["muse-spark-1.3-contributor"]).toBe("openai-responses");
+  });
+
+  test("1.3 gets the same web_search strip (probed: 1.3 + search_content_types -> 400)", () => {
+    const body = build("muse-spark-1.3-contributor", { tools: [webSearchTool()] });
+    const tool = toolsOf(body)[0]!;
+    expect(tool.type).toBe("web_search");
+    expect(Object.hasOwn(tool, "search_content_types")).toBe(false);
+  });
+});
+
+/**
+ * Zen Go rejects function names longer than 64 chars and recursive JSON schemas
+ * (probed live: `name must be at most 64 characters, got 66` from Codex MCP tools
+ * such as `muse-spark-web-search-compat`, and `Recursive JSON schemas are not
+ * currently supported` from cyclic `$defs`). Dropping only the offending
+ * declarations lets the turn proceed with the remaining catalog instead of
+ * failing the whole request with a 400.
+ */
+describe("Muse Spark tool-surface compatibility", () => {
+  const functionTool = (name: string, parameters: Record<string, unknown> = { type: "object" }) => ({
+    type: "function",
+    name,
+    parameters,
+  });
+
+  test("drops function tools with names longer than 64 chars, keeps a 64-char name", () => {
+    const body = build("muse-spark-1.3-contributor", {
+      tools: [functionTool("a".repeat(65)), functionTool("b".repeat(64))],
+    });
+    const names = toolsOf(body).map(tool => tool.name);
+    expect(names).toEqual(["b".repeat(64)]);
+  });
+
+  test("a nested additional_tools declaration is filtered too", () => {
+    const body = build("muse-spark-1.3-contributor", {
+      input: [{ type: "additional_tools", tools: [functionTool("c".repeat(66))] }],
+    });
+    const item = (body.input as Array<Record<string, unknown>>)[0]!;
+    expect((item.tools as unknown[])).toEqual([]);
+  });
+
+  test("tool_choice naming a dropped tool falls back to auto", () => {
+    const longName = "d".repeat(65);
+    const body = build("muse-spark-1.3-contributor", {
+      tools: [functionTool(longName)],
+      tool_choice: { type: "function", name: longName },
+    });
+    expect(body.tool_choice).toBe("auto");
+  });
+
+  test("another model on the same provider keeps over-long names untouched", () => {
+    const body = build("gpt-5.6-luna", { tools: [functionTool("e".repeat(65))] });
+    expect(toolsOf(body).map(tool => tool.name)).toEqual(["e".repeat(65)]);
+  });
+
+  const cyclicParameters = () => ({
+    type: "object",
+    properties: { q: { $ref: "#/$defs/q" } },
+    $defs: { q: { type: "object", properties: { sub: { $ref: "#/$defs/q" } } } },
+  });
+
+  test("drops function tools with cyclic local $refs", () => {
+    const body = build("muse-spark-1.3-contributor", {
+      tools: [functionTool("cyclic_tool", cyclicParameters()), functionTool("fine_tool")],
+    });
+    expect(toolsOf(body).map(tool => tool.name)).toEqual(["fine_tool"]);
+  });
+
+  test("keeps diamond $refs that share one $defs entry without cycling", () => {
+    const diamond = {
+      type: "object",
+      properties: { a: { $ref: "#/$defs/x" }, b: { $ref: "#/$defs/x" } },
+      $defs: { x: { type: "string" } },
+    };
+    const body = build("muse-spark-1.3-contributor", {
+      tools: [functionTool("diamond_tool", diamond)],
+    });
+    expect(toolsOf(body).map(tool => tool.name)).toEqual(["diamond_tool"]);
+  });
+
+  test("another model on the same provider keeps cyclic schemas untouched", () => {
+    const body = build("gpt-5.6-luna", {
+      tools: [functionTool("cyclic_tool", cyclicParameters())],
+    });
+    expect(toolsOf(body).map(tool => tool.name)).toEqual(["cyclic_tool"]);
   });
 });
