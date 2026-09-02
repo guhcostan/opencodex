@@ -2092,16 +2092,27 @@ function dropMuseSparkOverlongToolNames(body: unknown, modelId: unknown): unknow
 function schemaRefGraphHasCycle(parameters: unknown): boolean {
   if (!isPlainObject(parameters)) return false;
   const root: Record<string, unknown> = parameters;
+  // Bounds the walk: nested diamond `$defs` expand exponentially without ever
+  // cycling, which would block the request loop on a small body. Mirrors the
+  // node budget in xai-tool-schema.ts; exceeding it fails closed (drop).
+  const budget = { remaining: 4_096 };
   const visit = (node: unknown, stack: string[]): boolean => {
+    if (budget.remaining <= 0) return true;
+    budget.remaining -= 1;
     if (Array.isArray(node)) return node.some(child => visit(child, stack));
     if (!isPlainObject(node)) return false;
     if (typeof node.$ref === "string") {
-      if (stack.includes(node.$ref)) return true;
+      const ref = node.$ref;
+      if (stack.includes(ref)) return true;
       // Remote or unresolvable refs cannot be judged locally; leave them alone.
-      if (!node.$ref.startsWith("#/") && node.$ref !== "#" && node.$ref !== "#/") return false;
-      const target = lookupLocalJsonPointer(root, node.$ref);
-      if (target === undefined) return false;
-      return visit(target, [...stack, node.$ref]);
+      if (!ref.startsWith("#/") && ref !== "#" && ref !== "#/") return false;
+      const extended = [...stack, ref];
+      const target = lookupLocalJsonPointer(root, ref);
+      if (target !== undefined && visit(target, extended)) return true;
+      // `$ref` siblings are schema too (JSON Schema 2020-12): a root pairing
+      // `$ref` with a property that references `#` is recursive and must not
+      // be classified safe just because the target itself is acyclic.
+      return Object.entries(node).some(([key, child]) => key !== "$ref" && visit(child, stack));
     }
     return Object.values(node).some(child => visit(child, stack));
   };
@@ -2115,7 +2126,10 @@ function dropMuseSparkRecursiveSchemaTools(body: unknown, modelId: unknown): unk
   const filterTools = (tools: unknown[]): { tools: unknown[]; changed: boolean } => {
     let changed = false;
     const kept = tools.filter(tool => {
-      if (!isPlainObject(tool) || tool.type !== "function") return true;
+      // `custom` tools carry no JSON-schema `parameters` today, so in practice
+      // only `function` tools trip the cycle check; both are listed so a future
+      // custom shape with parameters gets the same guard.
+      if (!isPlainObject(tool) || (tool.type !== "function" && tool.type !== "custom")) return true;
       if (!isPlainObject(tool.parameters) || !schemaRefGraphHasCycle(tool.parameters)) return true;
       if (typeof tool.name === "string") dropped.add(tool.name);
       changed = true;
@@ -2140,7 +2154,6 @@ function dropMuseSparkRecursiveSchemaTools(body: unknown, modelId: unknown): unk
     debugProviderDiagnostic("openai-responses", "muse-spark-tools-dropped", {
       reason: "recursive-schema",
       count: dropped.size,
-      tools: [...dropped],
     });
     if (isPlainObject(next.tool_choice) && typeof next.tool_choice.name === "string" && dropped.has(next.tool_choice.name)) {
       next = { ...next, tool_choice: "auto" };

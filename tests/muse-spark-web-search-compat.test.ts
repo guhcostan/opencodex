@@ -165,6 +165,45 @@ describe("Muse Spark tool-surface compatibility", () => {
     expect(toolsOf(body).map(tool => tool.name)).toEqual(["diamond_tool"]);
   });
 
+  test("catches recursion through $ref siblings (JSON Schema $ref-with-siblings form)", () => {
+    const sneaky = {
+      $ref: "#/$defs/base",
+      properties: { loop: { $ref: "#" } },
+      $defs: { base: { type: "object" } },
+    };
+    const body = build("muse-spark-1.3-contributor", {
+      tools: [functionTool("sneaky_tool", sneaky), functionTool("fine_tool")],
+    });
+    expect(toolsOf(body).map(tool => tool.name)).toEqual(["fine_tool"]);
+  });
+
+  test("fails closed on over-budget $defs graphs instead of expanding exponentially", () => {
+    // Each level references its predecessor twice: depth N costs ~2^N visits
+    // without a bound. Depth 14 (~16k unbudgeted visits) must already drop.
+    const defs: Record<string, unknown> = { d0: { type: "string" } };
+    for (let i = 1; i <= 14; i += 1) {
+      defs[`d${i}`] = {
+        type: "object",
+        properties: { left: { $ref: `#/$defs/d${i - 1}` }, right: { $ref: `#/$defs/d${i - 1}` } },
+      };
+    }
+    const nested = { type: "object", properties: { root: { $ref: "#/$defs/d14" } }, $defs: defs };
+    const body = build("muse-spark-1.3-contributor", {
+      tools: [functionTool("nested_tool", nested), functionTool("fine_tool")],
+    });
+    expect(toolsOf(body).map(tool => tool.name)).toEqual(["fine_tool"]);
+  });
+
+  test("keeps a wide flat diamond that stays far under the walk budget", () => {
+    const properties: Record<string, unknown> = {};
+    for (let i = 0; i < 100; i += 1) properties[`p${i}`] = { $ref: "#/$defs/x" };
+    const wide = { type: "object", properties, $defs: { x: { type: "string" } } };
+    const body = build("muse-spark-1.3-contributor", {
+      tools: [functionTool("wide_tool", wide)],
+    });
+    expect(toolsOf(body).map(tool => tool.name)).toEqual(["wide_tool"]);
+  });
+
   test("another model on the same provider keeps cyclic schemas untouched", () => {
     const body = build("gpt-5.6-luna", {
       tools: [functionTool("cyclic_tool", cyclicParameters())],

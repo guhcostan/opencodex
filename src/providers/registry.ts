@@ -1486,6 +1486,7 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     - 선택한 방식: Declare only the named models as `openai-responses` through the existing registry default mechanism; the map stays an exact-model allowlist rather than a family or provider-wide rule.
     - 다른 대안 대신 이 방식을 선택한 이유: OpenCode Go documents sibling models on Chat or Anthropic endpoints, and an exact registry default preserves both those routes and explicit opt-out precedence.
     - 장점, 단점 및 영향: Each listed model reaches `/responses` from every inbound surface without changing siblings; a future upstream endpoint change requires an evidence-backed registry update.
+    - 2026-09-02 probe (muse-spark-1.3-contributor): Zen Go answers the same Responses-only shape as 1.2 — `/chat/completions` -> 500, `/responses` -> 200; `reasoning.effort` ladder is none/minimal/low/medium/high/xhigh (no `max`); plain `web_search` must not carry `search_content_types`; tool names are capped at 64 chars; recursive `$ref` schemas are refused. Added 1.3 to the allowlist with its ladder and a `max` -> `xhigh` map; context window and input modalities stay undeclared (unverified).
     */
     modelWireDefaults: {
       "gpt-5.6-luna": "openai-responses",
