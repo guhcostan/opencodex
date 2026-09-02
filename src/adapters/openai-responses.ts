@@ -2031,6 +2031,28 @@ function stripMuseSparkUnsupportedWebSearchFields(body: unknown, modelId: unknow
 }
 
 /**
+ * Re-point `tool_choice` after Muse Spark guards drop declarations. Handles the
+ * direct `{ type, name }` selector and Codex's `{ type: "allowed_tools",
+ * tools }` list: entries naming dropped tools are removed, an emptied list
+ * (or a dangling direct reference) falls back to `auto` so the turn does not
+ * take a second gateway 400 for a tool that is no longer declared.
+ */
+function fallbackMuseSparkToolChoice(
+  toolChoice: unknown,
+  dropped: ReadonlySet<string>,
+): unknown {
+  if (!isPlainObject(toolChoice)) return toolChoice;
+  if (typeof toolChoice.name === "string") {
+    return dropped.has(toolChoice.name) ? "auto" : toolChoice;
+  }
+  if (toolChoice.type !== "allowed_tools" || !Array.isArray(toolChoice.tools)) return toolChoice;
+  const kept = toolChoice.tools.filter(tool =>
+    !isPlainObject(tool) || typeof tool.name !== "string" || !dropped.has(tool.name));
+  if (kept.length === toolChoice.tools.length) return toolChoice;
+  return kept.length === 0 ? "auto" : { ...toolChoice, tools: kept };
+}
+
+/**
  * Zen Go rejects function/custom tool names longer than 64 chars
  * (`name must be at most 64 characters`), while Codex attaches MCP tools such
  * as `mcp__codex_apps__codex_document_control___get_document_tool_schemas`
@@ -2073,9 +2095,8 @@ function dropMuseSparkOverlongToolNames(body: unknown, modelId: unknown): unknow
       reason: "tool-name-gt-64-chars",
       count: dropped.size,
     });
-    if (isPlainObject(next.tool_choice) && typeof next.tool_choice.name === "string" && dropped.has(next.tool_choice.name)) {
-      next = { ...next, tool_choice: "auto" };
-    }
+    const repaired = fallbackMuseSparkToolChoice(next.tool_choice, dropped);
+    if (repaired !== next.tool_choice) next = { ...next, tool_choice: repaired };
   }
   return next === body ? body : next;
 }
@@ -2094,29 +2115,42 @@ function schemaRefGraphHasCycle(parameters: unknown): boolean {
   const root: Record<string, unknown> = parameters;
   // Bounds the walk: nested diamond `$defs` expand exponentially without ever
   // cycling, which would block the request loop on a small body. Mirrors the
-  // node budget in xai-tool-schema.ts; exceeding it fails closed (drop).
+  // ceilings in xai-tool-schema.ts; exceeding either fails closed (drop).
   const budget = { remaining: 4_096 };
-  const visit = (node: unknown, stack: string[]): boolean => {
-    if (budget.remaining <= 0) return true;
+  const maxDepth = 64;
+  // Refs proven acyclic by a completed walk. Sound to reuse across stacks
+  // (standard gray/black cycle-detection coloring): only walks that finish
+  // without hitting the budget or depth ceiling earn the mark, so a marked ref
+  // can never hide a cycle on a later path. Keeps wide shared `$defs` graphs
+  // cheap instead of re-walking one subtree per reference.
+  const provenAcyclic = new Set<string>();
+  const visit = (node: unknown, stack: string[], depth: number): boolean => {
+    if (budget.remaining <= 0 || depth >= maxDepth) return true;
     budget.remaining -= 1;
-    if (Array.isArray(node)) return node.some(child => visit(child, stack));
+    if (Array.isArray(node)) return node.some(child => visit(child, stack, depth + 1));
     if (!isPlainObject(node)) return false;
     if (typeof node.$ref === "string") {
       const ref = node.$ref;
       if (stack.includes(ref)) return true;
-      // Remote or unresolvable refs cannot be judged locally; leave them alone.
-      if (!ref.startsWith("#/") && ref !== "#" && ref !== "#/") return false;
-      const extended = [...stack, ref];
-      const target = lookupLocalJsonPointer(root, ref);
-      if (target !== undefined && visit(target, extended)) return true;
+      let targetRecursive = false;
+      if (ref.startsWith("#/") || ref === "#" || ref === "#/") {
+        if (!provenAcyclic.has(ref)) {
+          const target = lookupLocalJsonPointer(root, ref);
+          if (target !== undefined) {
+            targetRecursive = visit(target, [...stack, ref], depth + 1);
+            if (!targetRecursive) provenAcyclic.add(ref);
+          }
+        }
+      }
+      if (targetRecursive) return true;
       // `$ref` siblings are schema too (JSON Schema 2020-12): a root pairing
       // `$ref` with a property that references `#` is recursive and must not
       // be classified safe just because the target itself is acyclic.
-      return Object.entries(node).some(([key, child]) => key !== "$ref" && visit(child, stack));
+      return Object.entries(node).some(([key, child]) => key !== "$ref" && visit(child, stack, depth + 1));
     }
-    return Object.values(node).some(child => visit(child, stack));
+    return Object.values(node).some(child => visit(child, stack, depth + 1));
   };
-  return visit(root, []);
+  return visit(root, [], 0);
 }
 
 function dropMuseSparkRecursiveSchemaTools(body: unknown, modelId: unknown): unknown {
@@ -2155,9 +2189,8 @@ function dropMuseSparkRecursiveSchemaTools(body: unknown, modelId: unknown): unk
       reason: "recursive-schema",
       count: dropped.size,
     });
-    if (isPlainObject(next.tool_choice) && typeof next.tool_choice.name === "string" && dropped.has(next.tool_choice.name)) {
-      next = { ...next, tool_choice: "auto" };
-    }
+    const repaired = fallbackMuseSparkToolChoice(next.tool_choice, dropped);
+    if (repaired !== next.tool_choice) next = { ...next, tool_choice: repaired };
   }
   return next === body ? body : next;
 }

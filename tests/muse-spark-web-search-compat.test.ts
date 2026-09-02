@@ -98,8 +98,9 @@ describe("#2617 Muse Spark web_search compatibility", () => {
 /**
  * Zen Go rejects function names longer than 64 chars and recursive JSON schemas
  * (probed live: `name must be at most 64 characters, got 66` from Codex MCP tools
- * such as `muse-spark-web-search-compat`, and `Recursive JSON schemas are not
- * currently supported` from cyclic `$defs`). Dropping only the offending
+ * such as `mcp__codex_apps__codex_document_control___get_document_tool_schemas`
+ * (67 chars), and `Recursive JSON schemas are not currently supported` from
+ * cyclic `$defs`). Dropping only the offending
  * declarations lets the turn proceed with the remaining catalog instead of
  * failing the whole request with a 400.
  */
@@ -131,6 +132,33 @@ describe("Muse Spark tool-surface compatibility", () => {
     const body = build("muse-spark-1.3-contributor", {
       tools: [functionTool(longName)],
       tool_choice: { type: "function", name: longName },
+    });
+    expect(body.tool_choice).toBe("auto");
+  });
+
+  test("allowed_tools entries naming dropped tools are filtered", () => {
+    const longName = "f".repeat(65);
+    const body = build("muse-spark-1.3-contributor", {
+      tools: [functionTool(longName), functionTool("fine_tool")],
+      tool_choice: {
+        type: "allowed_tools",
+        tools: [
+          { type: "function", name: longName },
+          { type: "function", name: "fine_tool" },
+        ],
+      },
+    });
+    expect(body.tool_choice).toEqual({
+      type: "allowed_tools",
+      tools: [{ type: "function", name: "fine_tool" }],
+    });
+  });
+
+  test("an allowed_tools list left empty by drops falls back to auto", () => {
+    const longName = "g".repeat(65);
+    const body = build("muse-spark-1.3-contributor", {
+      tools: [functionTool(longName)],
+      tool_choice: { type: "allowed_tools", tools: [{ type: "function", name: longName }] },
     });
     expect(body.tool_choice).toBe("auto");
   });
@@ -177,19 +205,35 @@ describe("Muse Spark tool-surface compatibility", () => {
     expect(toolsOf(body).map(tool => tool.name)).toEqual(["fine_tool"]);
   });
 
-  test("fails closed on over-budget $defs graphs instead of expanding exponentially", () => {
-    // Each level references its predecessor twice: depth N costs ~2^N visits
-    // without a bound. Depth 14 (~16k unbudgeted visits) must already drop.
-    const defs: Record<string, unknown> = { d0: { type: "string" } };
-    for (let i = 1; i <= 14; i += 1) {
-      defs[`d${i}`] = {
-        type: "object",
-        properties: { left: { $ref: `#/$defs/d${i - 1}` }, right: { $ref: `#/$defs/d${i - 1}` } },
-      };
-    }
-    const nested = { type: "object", properties: { root: { $ref: "#/$defs/d14" } }, $defs: defs };
+  test("fails closed on over-budget schemas instead of walking forever", () => {
+    // 5,000 distinct properties cost ~10k visits with nothing to share, past
+    // the 4,096-node budget: drop instead of blocking the request loop.
+    const properties: Record<string, unknown> = {};
+    for (let i = 0; i < 5000; i += 1) properties[`p${i}`] = { type: "string" };
     const body = build("muse-spark-1.3-contributor", {
-      tools: [functionTool("nested_tool", nested), functionTool("fine_tool")],
+      tools: [functionTool("huge_tool", { type: "object", properties }), functionTool("fine_tool")],
+    });
+    expect(toolsOf(body).map(tool => tool.name)).toEqual(["fine_tool"]);
+  });
+
+  test("memoizes shared $defs instead of re-walking one subtree per reference", () => {
+    // 1,500 properties sharing one $defs entry would cost ~6k unbudgeted
+    // visits; with proven-acyclic memoization it stays far under budget: kept.
+    const properties: Record<string, unknown> = {};
+    for (let i = 0; i < 1500; i += 1) properties[`p${i}`] = { $ref: "#/$defs/x" };
+    const shared = { type: "object", properties, $defs: { x: { type: "string" } } };
+    const body = build("muse-spark-1.3-contributor", {
+      tools: [functionTool("shared_tool", shared)],
+    });
+    expect(toolsOf(body).map(tool => tool.name)).toEqual(["shared_tool"]);
+  });
+
+  test("fails closed past the depth ceiling on deep acyclic chains", () => {
+    // 100 nested levels are acyclic but deeper than the 64-level ceiling.
+    let level: Record<string, unknown> = { type: "string" };
+    for (let i = 0; i < 100; i += 1) level = { type: "object", properties: { next: level } };
+    const body = build("muse-spark-1.3-contributor", {
+      tools: [functionTool("deep_tool", level), functionTool("fine_tool")],
     });
     expect(toolsOf(body).map(tool => tool.name)).toEqual(["fine_tool"]);
   });

@@ -1514,6 +1514,11 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
       // advertises it text-only and the Codex app blocks image attachments client-side with
       // "This model does not support image inputs" before the request ever reaches the proxy.
       "muse-spark-1.2-contributor": ["text", "image"],
+      // 1.3 accepts input_image parts over /responses too (probed 2026-09-02:
+      // completed response with image part, no 400). No context-window row for
+      // 1.3 yet: only declare it once a probe (not a sibling's docs) confirms
+      // the size, so the catalog keeps its 128k fallback instead of a guess.
+      "muse-spark-1.3-contributor": ["text", "image"],
     },
     modelReasoningEfforts: {
       "gpt-5.6-luna": OPENAI_API_GPT56_REASONING_EFFORTS,
