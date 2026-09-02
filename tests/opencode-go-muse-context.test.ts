@@ -52,3 +52,10 @@ describe("OpenCode Go Muse Spark context window", () => {
     expect(hinted.contextWindow).toBe(MUSE_CONTEXT);
   });
 });
+
+describe("OpenCode Go Muse Spark 1.3 Contributor context window", () => {
+  test("registry declares the shared 1M family window for 1.3", () => {
+    const entry = PROVIDER_REGISTRY.find(e => e.id === "opencode-go");
+    expect(entry?.modelContextWindows?.["muse-spark-1.3-contributor"]).toBe(MUSE_CONTEXT);
+  });
+});

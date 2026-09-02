@@ -1504,6 +1504,9 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
       // /responses on Zen Go, matching its 1.1 sibling (Meta developer docs, verified 2026-08-28).
       // Without this declaration the catalog falls back to 128k, capping real usable context.
       "muse-spark-1.2-contributor": 1_048_576,
+      // 1.3 shares the same 1M window: Meta documents one shared window for the
+      // 1.1/1.2/1.3 family (ai.developer.meta.com/docs/models, verified 2026-09-02).
+      "muse-spark-1.3-contributor": 1_048_576,
     },
     modelInputModalities: {
       "kimi-k3": ["text", "image"],
